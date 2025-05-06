@@ -1,26 +1,15 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
 import pandas as pd
 import numpy as np
-
-import optuna
-
-import tensorflow as tf
-
 import os
 
+from pytorchmodel import PyTorchModel
 from sklearn.compose import ColumnTransformer
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 
-from tensorflow.keras import Model, Input  # pyright: ignore
-from tensorflow.keras.layers import Dense  # pyright: ignore
-from tensorflow.keras.models import Sequential  # pyright: ignore
-from tensorflow.keras.callbacks import TensorBoard, ModelCheckpoint  # pyright: ignore
-from tensorflow.keras.optimizers import Adam # pyright: ignore
-
-from optuna.integration import TFKerasPruningCallback
-
-import xgboost as xgb
-from sklearn.metrics import accuracy_score
 
 
 train_df = pd.read_csv("csv_files/space_titanic_train.csv")
@@ -87,7 +76,7 @@ def prepare_test_data():
 
 
 def scale_data(df_train, df_test):
-    X_train, X_val, y_train, y_val = train_test_split(df_train.drop("Transported", axis=1), df_train["Transported"], test_size=0.10, stratify=df_train["Transported"], random_state=42)
+    X_train, X_val, y_train, y_val = train_test_split(df_train.drop("Transported", axis=1), df_train["Transported"], test_size=0.15, stratify=df_train["Transported"], random_state=42)
     
     preprocessor = ColumnTransformer(
         transformers=[
@@ -107,127 +96,101 @@ def scale_data(df_train, df_test):
         remainder="passthrough",
     )
     
-    X_train = preprocessor.fit_transform(X_train)
-    X_val = preprocessor.transform(X_val)
-    X_test = preprocessor.transform(df_test.drop("PassengerId", axis=1))
-    return X_train, X_val, y_train, y_val, X_test
+
+    X_train = torch.tensor(preprocessor.fit_transform(X_train), dtype=torch.float32)
+    X_val = torch.tensor(preprocessor.transform(X_val), dtype=torch.float32)
+    X_test = torch.tensor(preprocessor.transform(df_test.drop("PassengerId", axis=1)), dtype=torch.float32)
+    
+    y_train = torch.tensor(y_train.values, dtype=torch.float32).unsqueeze(1)
+    y_val = torch.tensor(y_val.values, dtype=torch.float32).unsqueeze(1)
+
+    return X_train, X_val, X_test, y_train, y_val
 
 
-def sequential_model(trial, X_train, X_val, y_train, y_val):
-    epochs = trial.suggest_categorical("epochs", [8, 10, 12, 14])
-    batch_size = trial.suggest_categorical("batch_size", [18, 20, 24])
-    callbacks = [
-        tf.keras.callbacks.EarlyStopping(
-            monitor="val_loss", patience=3, restore_best_weights=True
-        ),
-        TFKerasPruningCallback(trial, "val_loss"),
-        TensorBoard(
-            log_dir="logs/fit/" + str(trial.number),
-            histogram_freq=1,
-            write_graph=True,
-            write_images=True,
-        ),
-    ]
+def pytorch_model(X_train, X_val, X_test, y_train, y_val, test_df, epochs=10, batch_size=24, num_workers=0):
+    train_data = torch.utils.data.TensorDataset(X_train, y_train)
+    val_data = torch.utils.data.TensorDataset(X_val, y_val)
+    test_data = torch.utils.data.TensorDataset(X_test)
+    train_loader = torch.utils.data.DataLoader(train_data, batch_size=batch_size, num_workers=num_workers,pin_memory=True)
+    val_loader = torch.utils.data.DataLoader(val_data, batch_size=batch_size, num_workers=num_workers, pin_memory=True)
+    test_loader = torch.utils.data.DataLoader(test_data, batch_size=batch_size, num_workers=num_workers, pin_memory=True)
+    
+    device = torch.device("cpu")
+    model = PyTorchModel(X_train.shape[1]).to(device)
+    optimizer = optim.Adam(model.parameters())
+    loss_fn = nn.BCELoss()
+    print(os.cpu_count())
+    print(torch.__version__) 
+    print(torch.version.cuda)
 
-    model = Sequential()
-    model.add(Dense(128, input_dim=X_train.shape[1], activation="relu"))
-    model.add(Dense(128, activation="relu"))
-    model.add(Dense(1, activation="sigmoid"))
-    model.compile(optimizer=Adam(), loss="binary_crossentropy", metrics=["accuracy"])
+    best_val_accuracy = 0.0
+    history = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': []}
 
-    history = model.fit(
-        X_train,
-        y_train,
-        epochs=epochs,
-        batch_size=batch_size,
-        callbacks=callbacks,
-        validation_data=(X_val, y_val)
-    )
-    best_val_accuracy = max(history.history['val_accuracy'])
-    return best_val_accuracy
+    print("Starting Training...")
+    size = len(train_loader.dataset)
+    for epoch in range(epochs):
+        model.train()
+        running_train_loss = 0.0
+        correct_train = 0
+        total_train = 0
 
-def build_functional_model(trial, X_train, X_val, y_train, y_val):
-    epochs = trial.suggest_categorical("epochs", [8, 10, 12, 14])
-    batch_size = trial.suggest_categorical("batch_size", [18, 20, 24])
-    callbacks = [
-        tf.keras.callbacks.EarlyStopping(
-            monitor="val_loss", patience=3, restore_best_weights=True
-        ),
-        TFKerasPruningCallback(trial, "val_loss"),
-        TensorBoard(
-            log_dir="logs/fit/" + str(trial.number),
-            histogram_freq=1,
-            write_graph=True,
-            write_images=True,
-        ),
-    ]
-    inputs = Input(shape=(X_train.shape[1],))
-    x = Dense(128, activation="relu")(inputs)
-    x = Dense(128, activation="relu")(x)
-    outputs = Dense(1, activation="sigmoid")(x)
-    model = Model(inputs, outputs)
-    model.compile(optimizer=Adam(), loss="binary_crossentropy", metrics=["accuracy"])
-    history = model.fit(
-        X_train,
-        y_train,
-        epochs=epochs,
-        batch_size=batch_size,
-        callbacks=callbacks,
-        validation_data=(X_val, y_val)
-    )
-    best_val_accuracy = max(history.history['val_accuracy'])
-    return best_val_accuracy
-
-def build_xgboost_model(trial, X_train, X_val, y_train, y_val):
-    params = {
-        "objective": "binary:logistic",
-        "eval_metric": "logloss",
-        "use_label_encoder": False,
-        "max_depth": trial.suggest_int("max_depth", 3, 10),
-        "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
-        "n_estimators": trial.suggest_int("n_estimators", 100, 500, step=50),
-        "subsample": trial.suggest_float("subsample", 0.6, 1.0),
-        "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
-    }
-
-    model = xgb.XGBClassifier(**params)
-    model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=True)
-
-    # preds = model.predict(X_val)
-    # acc = accuracy_score(y_val, preds)
-    y_pred = model.predict(X_val)
-    y_pred = (y_pred > 0.5)  # For binary classification
-    acc = accuracy_score(y_val, y_pred)
-    return acc
+        for batch, (inputs, labels) in enumerate(train_loader):
+            inputs, labels = inputs.to(device), labels.to(device)
 
 
-def optuna_optimization(X_train, X_val, y_train, y_val):
-    study = optuna.create_study(
-        direction="maximize", pruner=optuna.pruners.MedianPruner(n_warmup_steps=5)
-    )
-    # study.optimize(
-    #     lambda trial: sequential_model(trial, X_train, X_val, y_train, y_val),
-    #     n_trials=12, n_jobs=-1
-    # )
-    # study.optimize(
-    #     lambda trial: build_functional_model(trial, X_train, X_val, y_train, y_val),
-    #     n_trials=12, n_jobs=-1
-    # )
-    study.optimize(
-        lambda trial: build_xgboost_model(trial, X_train, X_val, y_train, y_val),
-        n_trials=128, n_jobs=-1
-    )
-    print(f"Best params: {study.best_trial.params}")
-    print("Best val accuracy: {:.4f}".format(study.best_value))
+            outputs = model(inputs)
+            loss = loss_fn(outputs, labels)
+
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
+
+            running_train_loss += loss.item() * inputs.size(0)
+            predicted = (outputs > 0.5).float()
+            total_train += labels.size(0)
+            correct_train += (predicted == labels).sum().item()
+
+        epoch_train_loss = running_train_loss / len(train_loader.dataset)
+        epoch_train_acc = correct_train / total_train
+        history['train_loss'].append(epoch_train_loss)
+        history['train_acc'].append(epoch_train_acc)
+
+        model.eval()
+        running_val_loss = 0.0
+        correct_val = 0
+        total_val = 0
+
+        with torch.no_grad():
+            for inputs, labels in val_loader:
+                inputs, labels = inputs.to(device), labels.to(device)
+
+                outputs = model(inputs)
+                loss = loss_fn(outputs, labels)
+
+                running_val_loss += loss.item() * inputs.size(0)
+                predicted = (outputs > 0.5).float()
+                total_val += labels.size(0)
+                correct_val += (predicted == labels).sum().item()
+
+        epoch_val_loss = running_val_loss / len(val_loader.dataset)
+        epoch_val_acc = correct_val / total_val
+        history['val_loss'].append(epoch_val_loss)
+        history['val_acc'].append(epoch_val_acc)
+
+        print(f"Epoch [{epoch+1}/{epochs}] | "
+            f"Train Loss: {epoch_train_loss:.4f} | Train Acc: {epoch_train_acc:.4f} | "
+            f"Val Loss: {epoch_val_loss:.4f} | Val Acc: {epoch_val_acc:.4f}")
+
+        if epoch_val_acc > best_val_accuracy:
+            best_val_accuracy = epoch_val_acc
+        
     
 
 def main():
     train_df = prepare_train_data()
     test_df = prepare_test_data()
-    X_train, X_val, y_train, y_val, X_test = scale_data(train_df, test_df)
-    optuna_optimization(X_train, X_val, y_train, y_val)
-    # submition(X_test, test_df)
-    # final(X_train, X_val, y_train, y_val, X_test, test_df)
+    X_train, X_val, X_test, y_train, y_val = scale_data(train_df, test_df)
+    pytorch_model(X_train, X_val, X_test, y_train, y_val, test_df)
 
 
 if __name__ == "__main__":
