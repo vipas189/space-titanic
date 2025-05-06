@@ -11,7 +11,6 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 
 
-
 train_df = pd.read_csv("csv_files/space_titanic_train.csv")
 
 
@@ -107,27 +106,26 @@ def scale_data(df_train, df_test):
     return X_train, X_val, X_test, y_train, y_val
 
 
-def pytorch_model(X_train, X_val, X_test, y_train, y_val, test_df, epochs=10, batch_size=24, num_workers=0):
+def pytorch_model(X_train, X_val, X_test, y_train, y_val, test_df, epochs=999, batch_size=52, num_workers=0, stop_val_loss_not_improving=20, lr=0.00081):
     train_data = torch.utils.data.TensorDataset(X_train, y_train)
     val_data = torch.utils.data.TensorDataset(X_val, y_val)
-    test_data = torch.utils.data.TensorDataset(X_test)
-    train_loader = torch.utils.data.DataLoader(train_data, batch_size=batch_size, num_workers=num_workers,pin_memory=True)
+    train_loader = torch.utils.data.DataLoader(train_data, batch_size=batch_size, num_workers=num_workers,pin_memory=True, shuffle=True)
     val_loader = torch.utils.data.DataLoader(val_data, batch_size=batch_size, num_workers=num_workers, pin_memory=True)
-    test_loader = torch.utils.data.DataLoader(test_data, batch_size=batch_size, num_workers=num_workers, pin_memory=True)
     
     device = torch.device("cpu")
     model = PyTorchModel(X_train.shape[1]).to(device)
-    optimizer = optim.Adam(model.parameters())
+    optimizer = optim.Adam(model.parameters(), lr=lr)
     loss_fn = nn.BCELoss()
     print(os.cpu_count())
     print(torch.__version__) 
     print(torch.version.cuda)
 
     best_val_accuracy = 0.0
-    history = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': []}
+    best_val_loss = float("inf")
+    not_improved_val_acc = 0
+    history = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': [], 'best_val_scores': []}
 
     print("Starting Training...")
-    size = len(train_loader.dataset)
     for epoch in range(epochs):
         model.train()
         running_train_loss = 0.0
@@ -136,7 +134,6 @@ def pytorch_model(X_train, X_val, X_test, y_train, y_val, test_df, epochs=10, ba
 
         for batch, (inputs, labels) in enumerate(train_loader):
             inputs, labels = inputs.to(device), labels.to(device)
-
 
             outputs = model(inputs)
             loss = loss_fn(outputs, labels)
@@ -154,6 +151,7 @@ def pytorch_model(X_train, X_val, X_test, y_train, y_val, test_df, epochs=10, ba
         epoch_train_acc = correct_train / total_train
         history['train_loss'].append(epoch_train_loss)
         history['train_acc'].append(epoch_train_acc)
+
 
         model.eval()
         running_val_loss = 0.0
@@ -176,13 +174,35 @@ def pytorch_model(X_train, X_val, X_test, y_train, y_val, test_df, epochs=10, ba
         epoch_val_acc = correct_val / total_val
         history['val_loss'].append(epoch_val_loss)
         history['val_acc'].append(epoch_val_acc)
-
         print(f"Epoch [{epoch+1}/{epochs}] | "
             f"Train Loss: {epoch_train_loss:.4f} | Train Acc: {epoch_train_acc:.4f} | "
             f"Val Loss: {epoch_val_loss:.4f} | Val Acc: {epoch_val_acc:.4f}")
-
-        if epoch_val_acc > best_val_accuracy:
+        if epoch_val_acc >= best_val_accuracy:
+            best_val_loss = epoch_val_loss
             best_val_accuracy = epoch_val_acc
+            not_improved_val_acc = 0
+            best_val_acc_list = history.get("best_val_scores")
+            best_val_acc_list.append(best_val_accuracy)
+            torch.save(model, f'models/model_val_acc-{best_val_accuracy:.4f}.pth')
+            try:
+                os.remove(f"models/model_val_acc-{best_val_acc_list[len(best_val_acc_list)-2]:.4f}.pth")
+            except FileNotFoundError:
+                pass
+            except IndexError:
+                pass
+            continue
+        
+        not_improved_val_acc += 1
+            
+        if not_improved_val_acc == stop_val_loss_not_improving:
+            print("Model stopped, no more improvement in validation accuracy")
+            break
+    print(f"Best\nVal_Acc: {best_val_accuracy}\nVal_Loss: {best_val_loss}")
+    with torch.no_grad():
+        outputs = model(X_test)
+        predicted = (outputs > 0.5).bool()
+    test_df["Transported"] = predicted.cpu().numpy()
+    test_df[["PassengerId", "Transported"]].to_csv(f"csv_files/submition_val_acc-{best_val_accuracy:.4f}.csv", index=False)
         
     
 
